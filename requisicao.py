@@ -5,7 +5,8 @@ import re
 
 # --- Funções de Scraping (adaptadas para Streamlit) ---
 
-@st.cache_data(ttl=3600) # Cacheia os resultados por 1 hora para evitar logins repetidos e requisições desnecessárias
+# Adicionado hash_funcs para requests.Session para evitar UnhashableParamError
+@st.cache_data(ttl=3600, hash_funcs={requests.Session: lambda _: None}) # Cacheia os resultados por 1 hora
 def login_sisgat(url_base, username, password):
     """
     Realiza o login no sistema SISGAT e retorna a sessão autenticada.
@@ -52,7 +53,8 @@ def login_sisgat(url_base, username, password):
         st.error(f"Ocorreu um erro durante o processo de login: {e}")
         return None, f"Ocorreu um erro durante o processo de login: {e}"
 
-@st.cache_data(ttl=600) # Cacheia os resultados por 10 minutos
+# Adicionado hash_funcs para requests.Session para evitar UnhashableParamError
+@st.cache_data(ttl=600, hash_funcs={requests.Session: lambda _: None}) # Cacheia os resultados por 10 minutos
 def obter_boletos_solicitados(session, url_base="https://sisgat.cbm.am.gov.br"):
     """
     Faz uma requisição GET para a página de boletos solicitados no SISGAT
@@ -115,7 +117,8 @@ def obter_boletos_solicitados(session, url_base="https://sisgat.cbm.am.gov.br"):
         st.error(f"Ocorreu um erro ao parsear a página de boletos solicitados: {e}")
         return []
 
-@st.cache_data(ttl=600) # Cacheia os resultados por 10 minutos
+# Adicionado hash_funcs para requests.Session para evitar UnhashableParamError
+@st.cache_data(ttl=600, hash_funcs={requests.Session: lambda _: None}) # Cacheia os resultados por 10 minutos
 def obter_detalhes_boleto_sisgat(session, boleto_id, url_base="https://sisgat.cbm.am.gov.br"):
     """
     Faz uma requisição GET para a página de visualização de um boleto específico no SISGAT
@@ -219,6 +222,11 @@ with st.sidebar:
     password = st.text_input("Senha", type="password", value="123456")
 
     if st.button("Fazer Login e Carregar Processos"):
+        # Limpar o cache de login e processos ao tentar um novo login
+        login_sisgat.clear()
+        obter_boletos_solicitados.clear()
+        obter_detalhes_boleto_sisgat.clear()
+
         st.session_state['session'], st.session_state['login_status'] = login_sisgat(SISGAT_URL_BASE, username, password)
         if st.session_state['session']:
             st.session_state['processos_listados'] = obter_boletos_solicitados(st.session_state['session'], SISGAT_URL_BASE)
