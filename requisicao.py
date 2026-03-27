@@ -4,7 +4,17 @@ from bs4 import BeautifulSoup
 import re
 import base64
 import time
-import io
+import threading
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait, Select
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from webdriver_manager.chrome import ChromeDriverManager
+
 
 # ============================================================
 # FUNÇÕES DE SCRAPING — SISGAT
@@ -133,9 +143,9 @@ def obter_detalhes_boleto_sisgat(session, boleto_id, url_base="https://sisgat.cb
 
         h3_element = soup.find('h3', string=lambda text: text and 'Visualização de Solicitação de Boleto para o Processo Nº' in text)
         if h3_element:
-            span_projeto_id = h3_element.find('span', style=lambda s: s and 'font-size:2rem; color:red;' in s)
-            if span_projeto_id:
-                detalhes['numero_processo'] = span_projeto_id.get_text(strip=True)
+            span = h3_element.find('span', style=lambda s: s and 'font-size:2rem; color:red;' in s)
+            if span:
+                detalhes['numero_processo'] = span.get_text(strip=True)
 
         detalhes['usuario_solicitante']       = extract_detail('Usuário Solicitante')
         detalhes['servidor_dat_gerou_boleto'] = extract_detail('Servidor DAT que gerou o boleto')
@@ -169,9 +179,9 @@ def obter_detalhes_boleto_sisgat(session, boleto_id, url_base="https://sisgat.cb
         if detalhes.get('area_edificada'):
             detalhes['area_edificada'] = detalhes['area_edificada'].replace(' m²', '').replace(',', '.').strip()
 
-        detalhes['nome_pagador']              = detalhes.get('razao_social')
-        detalhes['cnpj_pagador']              = detalhes.get('cpf_cnpj')
-        detalhes['endereco_completo_pagador'] = detalhes.get('endereco')
+        detalhes['nome_pagador']               = detalhes.get('razao_social')
+        detalhes['cnpj_pagador']               = detalhes.get('cpf_cnpj')
+        detalhes['endereco_completo_pagador']  = detalhes.get('endereco')
 
         if detalhes.get('numero_processo') and detalhes.get('tipo_taxa_solicitada'):
             detalhes['mensagem_boleto_para_banco'] = (
@@ -190,449 +200,289 @@ def obter_detalhes_boleto_sisgat(session, boleto_id, url_base="https://sisgat.cb
 
 
 # ============================================================
-# FUNÇÕES BRADESCO — SOMENTE REQUESTS
+# AUTOMAÇÃO BRADESCO — SELENIUM (preenche e aguarda o usuário)
 # ============================================================
 
-BRADESCO_URL_BASE = "https://www.ne2.bradesconetempresa.b.br"
+BRADESCO_URL_BASE  = "https://www.ne2.bradesconetempresa.b.br"
 BRADESCO_LOGIN_URL = f"{BRADESCO_URL_BASE}/ibpjlogin/login.jsf"
 
 
-def extrair_campos_hidden(soup: BeautifulSoup) -> dict:
+def criar_driver():
     """
-    Extrai todos os campos <input type="hidden"> de uma página JSF.
-    Isso captura ViewState, j_id tokens e quaisquer outros campos obrigatórios.
+    Cria o ChromeDriver em modo VISÍVEL para que o usuário
+    possa acompanhar e finalizar a emissão manualmente.
     """
-    campos = {}
-    for inp in soup.find_all('input', {'type': 'hidden'}):
-        nome = inp.get('name') or inp.get('id')
-        valor = inp.get('value', '')
-        if nome:
-            campos[nome] = valor
-    return campos
+    options = Options()
+    options.add_argument("--start-maximized")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+
+    service = Service(ChromeDriverManager().install())
+    driver  = webdriver.Chrome(service=service, options=options)
+    driver.execute_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    )
+    return driver
 
 
-def extrair_action_form(soup: BeautifulSoup, form_id: str = None) -> str | None:
+def preencher_campo(driver, wait, seletores: list[tuple], valor: str, log_fn=None):
     """
-    Retorna o atributo 'action' do formulário JSF principal.
-    Se form_id for fornecido, busca o form por ID; caso contrário, pega o primeiro form.
+    Tenta preencher um campo usando uma lista de seletores (By, valor).
+    Para cada seletor, tenta localizar e preencher. Ignora se não encontrar.
     """
-    if form_id:
-        form = soup.find('form', {'id': form_id})
-    else:
-        form = soup.find('form')
-
-    if form and form.get('action'):
-        action = form['action']
-        if action.startswith('/'):
-            return f"{BRADESCO_URL_BASE}{action}"
-        return action
-    return None
-
-
-def montar_headers_bradesco(referer: str = None) -> dict:
-    """Headers que simulam um navegador real para evitar bloqueios básicos."""
-    headers = {
-        'User-Agent': (
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-            'AppleWebKit/537.36 (KHTML, like Gecko) '
-            'Chrome/124.0.0.0 Safari/537.36'
-        ),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-    }
-    if referer:
-        headers['Referer'] = referer
-    return headers
+    for by, seletor in seletores:
+        try:
+            el = wait.until(EC.presence_of_element_located((by, seletor)))
+            el.click()
+            el.clear()
+            el.send_keys(str(valor))
+            if log_fn:
+                log_fn(f"   ✅ Preenchido '{seletor}' com '{str(valor)[:40]}'")
+            return True
+        except Exception:
+            continue
+    if log_fn:
+        log_fn(f"   ⚠️  Campo não encontrado para valor '{str(valor)[:40]}' — pulando.")
+    return False
 
 
-def login_bradesco(
+def preencher_select(driver, wait, seletores: list[tuple], valor: str, log_fn=None):
+    """Seleciona uma opção em um <select> pelo texto visível ou valor."""
+    for by, seletor in seletores:
+        try:
+            el = wait.until(EC.presence_of_element_located((by, seletor)))
+            sel = Select(el)
+            try:
+                sel.select_by_visible_text(valor)
+            except Exception:
+                sel.select_by_value(valor)
+            if log_fn:
+                log_fn(f"   ✅ Select '{seletor}' → '{valor}'")
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def abrir_bradesco_e_preencher(
     login: str,
     senha: str,
-    log_fn=None
-) -> tuple[requests.Session | None, str, BeautifulSoup | None]:
-    """
-    Realiza o login no Bradesco Net Empresa via POST puro.
-    Retorna (session, mensagem, soup_pos_login).
-
-    O fluxo JSF exige:
-      1. GET na página de login para capturar ViewState e demais hidden fields.
-      2. POST com os campos do formulário preenchidos.
-    """
-    session = requests.Session()
-
-    def log(msg):
-        if log_fn:
-            log_fn(msg)
-
-    try:
-        log("🌐 Acessando página de login do Bradesco...")
-        resp_get = session.get(
-            BRADESCO_LOGIN_URL,
-            headers=montar_headers_bradesco(),
-            timeout=30
-        )
-        resp_get.raise_for_status()
-
-        soup_login = BeautifulSoup(resp_get.text, 'html.parser')
-
-        # Extrai todos os campos hidden (ViewState, j_id, etc.)
-        campos_hidden = extrair_campos_hidden(soup_login)
-        log(f"🔑 Campos hidden capturados: {list(campos_hidden.keys())}")
-
-        # Identifica o ID dos campos de usuário e senha no HTML
-        # O Bradesco JSF costuma usar IDs como 'form:username' ou 'j_username'
-        campo_usuario_el = (
-            soup_login.find('input', {'name': re.compile(r'usuario|username|login|cpf', re.I)})
-            or soup_login.find('input', {'id': re.compile(r'usuario|username|login|cpf', re.I)})
-        )
-        campo_senha_el = (
-            soup_login.find('input', {'name': re.compile(r'senha|password|pwd', re.I)})
-            or soup_login.find('input', {'id': re.compile(r'senha|password|pwd', re.I)})
-        )
-
-        nome_campo_usuario = campo_usuario_el.get('name') or campo_usuario_el.get('id') if campo_usuario_el else 'j_username'
-        nome_campo_senha   = campo_senha_el.get('name')   or campo_senha_el.get('id')   if campo_senha_el   else 'j_password'
-
-        log(f"📝 Campo usuário identificado: '{nome_campo_usuario}' | Campo senha: '{nome_campo_senha}'")
-
-        # Monta o payload completo: campos hidden + credenciais + botão de submit
-        payload = {**campos_hidden}
-        payload[nome_campo_usuario] = login
-        payload[nome_campo_senha]   = senha
-
-        # Botão de submit — captura o name/value se existir
-        btn_submit = soup_login.find('input', {'type': 'submit'})
-        if btn_submit:
-            btn_name  = btn_submit.get('name')
-            btn_value = btn_submit.get('value', 'Entrar')
-            if btn_name:
-                payload[btn_name] = btn_value
-
-        # URL de action do form
-        action_url = extrair_action_form(soup_login) or BRADESCO_LOGIN_URL
-
-        log(f"📤 Enviando credenciais para: {action_url}")
-        resp_post = session.post(
-            action_url,
-            data=payload,
-            headers=montar_headers_bradesco(referer=BRADESCO_LOGIN_URL),
-            allow_redirects=True,
-            timeout=30
-        )
-        resp_post.raise_for_status()
-
-        soup_pos = BeautifulSoup(resp_post.text, 'html.parser')
-        url_final = resp_post.url.lower()
-
-        # Verifica se ainda está na tela de login (falha)
-        if "login" in url_final or "erro" in url_final:
-            return None, "❌ Falha no login. Bradesco redirecionou de volta ao login.", None
-
-        # Verifica mensagens de erro na página
-        erros = soup_pos.find_all(string=re.compile(r'inválid|erro|incorret|bloqueado', re.I))
-        if erros:
-            msgs = [e.strip() for e in erros if e.strip()]
-            return None, f"❌ Erro retornado pelo Bradesco: {msgs[0] if msgs else 'Credencial inválida.'}", None
-
-        log("✅ Login no Bradesco realizado com sucesso.")
-        return session, "Login bem-sucedido!", soup_pos
-
-    except requests.exceptions.RequestException as e:
-        return None, f"❌ Erro de requisição no login Bradesco: {e}", None
-    except Exception as e:
-        return None, f"❌ Erro inesperado no login Bradesco: {e}", None
-
-
-def navegar_para_cobranca(
-    session: requests.Session,
-    soup_home: BeautifulSoup,
-    url_atual: str,
-    log_fn=None
-) -> tuple[bool, str, BeautifulSoup | None, str | None]:
-    """
-    A partir da página inicial pós-login, localiza e acessa o menu de Cobrança.
-    Retorna (sucesso, mensagem, soup_cobranca, url_cobranca).
-    """
-    def log(msg):
-        if log_fn:
-            log_fn(msg)
-
-    try:
-        # Tenta encontrar link de Cobrança no menu
-        link_cobranca = (
-            soup_home.find('a', string=re.compile(r'cobran', re.I))
-            or soup_home.find('a', href=re.compile(r'cobran', re.I))
-        )
-
-        if link_cobranca and link_cobranca.get('href'):
-            href = link_cobranca['href']
-            url_cobranca = href if href.startswith('http') else f"{BRADESCO_URL_BASE}{href}"
-        else:
-            # Fallback: tenta URL conhecida de cobrança do Bradesco Net Empresa
-            url_cobranca = f"{BRADESCO_URL_BASE}/ibpjcobranca/cobranca.jsf"
-
-        log(f"📂 Navegando para área de Cobrança: {url_cobranca}")
-        resp = session.get(
-            url_cobranca,
-            headers=montar_headers_bradesco(referer=url_atual),
-            timeout=30
-        )
-        resp.raise_for_status()
-
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        return True, "Cobrança acessada.", soup, resp.url
-
-    except Exception as e:
-        return False, f"❌ Erro ao navegar para Cobrança: {e}", None, None
-
-
-def navegar_para_emissao_boleto(
-    session: requests.Session,
-    soup_cobranca: BeautifulSoup,
-    url_cobranca: str,
-    log_fn=None
-) -> tuple[bool, str, BeautifulSoup | None, str | None]:
-    """
-    A partir da página de Cobrança, localiza e acessa a tela de Emissão de Boleto.
-    Retorna (sucesso, mensagem, soup_emissao, url_emissao).
-    """
-    def log(msg):
-        if log_fn:
-            log_fn(msg)
-
-    try:
-        link_emissao = (
-            soup_cobranca.find('a', string=re.compile(r'emitir|emiss|boleto', re.I))
-            or soup_cobranca.find('a', href=re.compile(r'emitir|boleto|titulos', re.I))
-        )
-
-        if link_emissao and link_emissao.get('href'):
-            href = link_emissao['href']
-            url_emissao = href if href.startswith('http') else f"{BRADESCO_URL_BASE}{href}"
-        else:
-            url_emissao = f"{BRADESCO_URL_BASE}/ibpjcobranca/emissaoBoleto.jsf"
-
-        log(f"📄 Acessando tela de emissão de boleto: {url_emissao}")
-        resp = session.get(
-            url_emissao,
-            headers=montar_headers_bradesco(referer=url_cobranca),
-            timeout=30
-        )
-        resp.raise_for_status()
-
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        return True, "Tela de emissão acessada.", soup, resp.url
-
-    except Exception as e:
-        return False, f"❌ Erro ao acessar tela de emissão: {e}", None, None
-
-
-def preencher_e_submeter_boleto(
-    session: requests.Session,
-    soup_emissao: BeautifulSoup,
-    url_emissao: str,
     dados: dict,
     log_fn=None
-) -> tuple[bool, str, bytes | None]:
+) -> tuple[bool, str]:
     """
-    Preenche os campos do formulário de emissão de boleto pelos IDs/names
-    extraídos do HTML e submete. Retorna (sucesso, mensagem, bytes_pdf).
+    Abre o Chrome, loga no Bradesco Net Empresa, navega até
+    Cobrança > Emitir Boleto e preenche todos os campos com
+    os dados do SISGAT.
 
-    A estratégia é:
-      1. Extrair todos os campos hidden (ViewState, etc.).
-      2. Mapear os campos visíveis pelos seus name/id via BeautifulSoup.
-      3. Montar o payload com os dados do SISGAT.
-      4. POST e verificar se a resposta é um PDF ou contém link para PDF.
+    O navegador permanece ABERTO para o usuário revisar e
+    clicar em Confirmar/Emitir manualmente.
+
+    Retorna (sucesso, mensagem).
     """
     def log(msg):
         if log_fn:
             log_fn(msg)
 
+    driver = None
+
     try:
-        campos_hidden = extrair_campos_hidden(soup_emissao)
-        log(f"🔎 Campos hidden do formulário de emissão: {list(campos_hidden.keys())}")
+        log("🌐 Abrindo Chrome...")
+        driver = criar_driver()
+        wait   = WebDriverWait(driver, 25)
 
-        # Mapeia campos visíveis do formulário pelo name (JSF usa name composto: 'formId:fieldId')
-        def achar_campo(soup, *patterns):
-            """Tenta localizar um input/select/textarea pelo name ou id usando padrões."""
-            for pattern in patterns:
-                el = (
-                    soup.find('input', {'name': re.compile(pattern, re.I)})
-                    or soup.find('input', {'id': re.compile(pattern, re.I)})
-                    or soup.find('textarea', {'name': re.compile(pattern, re.I)})
-                    or soup.find('select', {'name': re.compile(pattern, re.I)})
-                )
-                if el:
-                    return el.get('name') or el.get('id')
-            return None
+        # ── PASSO 1: LOGIN ──────────────────────────────────────────
+        log(f"🔑 Acessando {BRADESCO_LOGIN_URL}")
+        driver.get(BRADESCO_LOGIN_URL)
+        time.sleep(2)
 
-        # Tenta identificar os campos no formulário JSF do Bradesco
-        campo_nosso_numero   = achar_campo(soup_emissao, r'nossoNumero', r'nosso.numero', r'nroTitulo')
-        campo_valor          = achar_campo(soup_emissao, r'valor', r'vlrTitulo', r'vlNominal')
-        campo_vencimento     = achar_campo(soup_emissao, r'vencimento', r'dtVencimento', r'dataVenc')
-        campo_nome_pagador   = achar_campo(soup_emissao, r'nomePagador', r'nome.pag', r'pagadorNome')
-        campo_cpfcnpj        = achar_campo(soup_emissao, r'cpfCnpj', r'cnpj', r'cpf', r'docPagador')
-        campo_endereco       = achar_campo(soup_emissao, r'endereco', r'logradouro', r'endPagador')
-        campo_cep            = achar_campo(soup_emissao, r'cep', r'cepPagador')
-        campo_instrucao1     = achar_campo(soup_emissao, r'instrucao1', r'instrucao', r'mensagem', r'obs')
+        log("📝 Preenchendo credenciais...")
 
-        log("📝 Campos identificados no formulário:")
-        log(f"   nosso_numero={campo_nosso_numero}, valor={campo_valor}, vencimento={campo_vencimento}")
-        log(f"   nome_pagador={campo_nome_pagador}, cpf_cnpj={campo_cpfcnpj}")
-        log(f"   endereco={campo_endereco}, cep={campo_cep}, instrucao={campo_instrucao1}")
+        # Seletores possíveis para campo de usuário e senha
+        # O Bradesco Net Empresa JSF usa IDs como 'form:j_id_...' que variam —
+        # por isso fornecemos múltiplas alternativas em ordem de prioridade.
+        preencher_campo(driver, wait, [
+            (By.CSS_SELECTOR, "input[name*='usuario']"),
+            (By.CSS_SELECTOR, "input[name*='login']"),
+            (By.CSS_SELECTOR, "input[name*='cpf']"),
+            (By.CSS_SELECTOR, "input[id*='usuario']"),
+            (By.CSS_SELECTOR, "input[id*='login']"),
+            (By.XPATH,        "//input[@type='text'][1]"),
+        ], login, log_fn=log)
 
-        # Monta payload base com campos hidden
-        payload = {**campos_hidden}
+        preencher_campo(driver, wait, [
+            (By.CSS_SELECTOR, "input[name*='senha']"),
+            (By.CSS_SELECTOR, "input[name*='password']"),
+            (By.CSS_SELECTOR, "input[name*='pwd']"),
+            (By.CSS_SELECTOR, "input[id*='senha']"),
+            (By.CSS_SELECTOR, "input[type='password']"),
+        ], senha, log_fn=log)
 
-        # Insere os dados do SISGAT nos campos identificados
-        mapeamento = {
-            campo_nosso_numero: dados.get('meu_numero', ''),
-            campo_valor:        dados.get('valor', ''),
-            campo_vencimento:   dados.get('vencimento', ''),
-            campo_nome_pagador: dados.get('nome_pagador', ''),
-            campo_cpfcnpj:      dados.get('cpf_cnpj', ''),
-            campo_endereco:     dados.get('endereco', ''),
-            campo_cep:          dados.get('cep', ''),
-            campo_instrucao1:   dados.get('mensagem_boleto_para_banco', ''),
-        }
-
-        for nome_campo, valor in mapeamento.items():
-            if nome_campo and valor:
-                payload[nome_campo] = str(valor)
-
-        # Captura botão de submit (confirmar/emitir)
-        btn = (
-            soup_emissao.find('input', {'type': 'submit'})
-            or soup_emissao.find('button', {'type': 'submit'})
-        )
-        if btn:
-            btn_name  = btn.get('name')
-            btn_value = btn.get('value', 'Confirmar')
-            if btn_name:
-                payload[btn_name] = btn_value
-
-        action_url = extrair_action_form(soup_emissao) or url_emissao
-
-        log(f"📤 Submetendo formulário de emissão para: {action_url}")
-        resp = session.post(
-            action_url,
-            data=payload,
-            headers=montar_headers_bradesco(referer=url_emissao),
-            allow_redirects=True,
-            timeout=60
-        )
-        resp.raise_for_status()
-
-        content_type = resp.headers.get('Content-Type', '')
-
-        # CASO 1: A resposta já é o PDF diretamente
-        if 'application/pdf' in content_type:
-            log("✅ Boleto PDF recebido diretamente na resposta.")
-            return True, "Boleto gerado com sucesso!", resp.content
-
-        # CASO 2: A resposta é HTML com link para o PDF
-        soup_resp = BeautifulSoup(resp.text, 'html.parser')
-        link_pdf = soup_resp.find('a', href=re.compile(r'\.pdf', re.I))
-        if not link_pdf:
-            # Tenta iframe ou embed com src de PDF
-            link_pdf = (
-                soup_resp.find('iframe', src=re.compile(r'\.pdf|boleto', re.I))
-                or soup_resp.find('embed', src=re.compile(r'\.pdf|boleto', re.I))
+        # Clica no botão de entrar
+        log("🖱️  Clicando em Entrar...")
+        try:
+            btn = wait.until(EC.element_to_be_clickable((
+                By.XPATH,
+                "//input[@type='submit'] | //button[@type='submit'] | "
+                "//input[contains(@value,'Entrar')] | //input[contains(@value,'Acessar')]"
+            )))
+            btn.click()
+        except TimeoutException:
+            log("⚠️  Botão de submit não encontrado via XPath padrão — tentando JS click...")
+            driver.execute_script(
+                "document.querySelector('input[type=submit], button[type=submit]').click()"
             )
 
-        if link_pdf:
-            href_pdf = link_pdf.get('href') or link_pdf.get('src')
-            url_pdf  = href_pdf if href_pdf.startswith('http') else f"{BRADESCO_URL_BASE}{href_pdf}"
-            log(f"📎 Link de PDF encontrado, baixando: {url_pdf}")
-            resp_pdf = session.get(
-                url_pdf,
-                headers=montar_headers_bradesco(referer=resp.url),
-                timeout=60
-            )
-            resp_pdf.raise_for_status()
-            if resp_pdf.content:
-                return True, "Boleto PDF baixado com sucesso!", resp_pdf.content
-            else:
-                return False, "❌ Link de PDF encontrado, mas o download retornou vazio.", None
+        time.sleep(3)
 
-        # CASO 3: Verifica se há mensagem de sucesso na página (boleto gerado mas PDF em outra etapa)
-        msg_sucesso = soup_resp.find(string=re.compile(r'sucesso|gerado|emitido|registrado', re.I))
-        if msg_sucesso:
-            log("⚠️ Boleto possivelmente gerado, mas PDF não foi retornado automaticamente.")
+        # Verifica se ainda está no login
+        if "login" in driver.current_url.lower():
             return False, (
-                "⚠️ O Bradesco confirmou a emissão, mas o PDF não foi retornado "
-                "automaticamente. Pode ser necessário uma etapa adicional de confirmação "
-                "ou o site exige interação com componente JSF dinâmico (AJAX)."
-            ), None
+                "❌ Login falhou. Verifique as credenciais ou se o site "
+                "exige certificado digital / token físico."
+            )
 
-        # CASO 4: Falha genérica
-        log("❌ Nenhum PDF nem confirmação de sucesso encontrados na resposta.")
-        return False, (
-            "❌ O formulário foi submetido, mas o Bradesco não retornou o boleto. "
-            "O sistema pode exigir autenticação adicional (token/certificado) "
-            "ou o fluxo usa chamadas AJAX que não foram capturadas."
-        ), None
+        log("✅ Login realizado. Página atual: " + driver.current_url)
+
+        # ── PASSO 2: NAVEGAR ATÉ COBRANÇA ──────────────────────────
+        log("📂 Procurando menu de Cobrança...")
+        try:
+            menu_cob = wait.until(EC.element_to_be_clickable((
+                By.XPATH,
+                "//*[contains(text(),'Cobrança') or contains(text(),'cobrança') "
+                "or contains(text(),'COBRANÇA')]"
+            )))
+            menu_cob.click()
+            time.sleep(2)
+            log("✅ Menu Cobrança clicado.")
+        except TimeoutException:
+            log("⚠️  Menu Cobrança não encontrado automaticamente.")
+            log("    Tentando URL direta: /ibpjcobranca/cobranca.jsf")
+            driver.get(f"{BRADESCO_URL_BASE}/ibpjcobranca/cobranca.jsf")
+            time.sleep(2)
+
+        # ── PASSO 3: NAVEGAR ATÉ EMITIR BOLETO ─────────────────────
+        log("📄 Procurando opção Emitir Boleto...")
+        try:
+            emitir = wait.until(EC.element_to_be_clickable((
+                By.XPATH,
+                "//*[contains(text(),'Emitir') or contains(text(),'emitir') "
+                "or contains(text(),'Boleto') or contains(text(),'boleto') "
+                "or contains(text(),'Título') or contains(text(),'título')]"
+            )))
+            emitir.click()
+            time.sleep(2)
+            log("✅ Tela de emissão acessada.")
+        except TimeoutException:
+            log("⚠️  Link de emissão não encontrado. Tentando URL direta...")
+            driver.get(f"{BRADESCO_URL_BASE}/ibpjcobranca/emissaoBoleto.jsf")
+            time.sleep(2)
+
+        log(f"📍 Página atual: {driver.current_url}")
+
+        # ── PASSO 4: PREENCHER DADOS DO BOLETO ─────────────────────
+        log("✏️  Preenchendo dados do boleto...")
+
+        # Nosso Número / Meu Número
+        if dados.get('meu_numero'):
+            preencher_campo(driver, WebDriverWait(driver, 10), [
+                (By.CSS_SELECTOR, "input[name*='nossoNumero']"),
+                (By.CSS_SELECTOR, "input[id*='nossoNumero']"),
+                (By.CSS_SELECTOR, "input[name*='nroTitulo']"),
+                (By.CSS_SELECTOR, "input[name*='meuNumero']"),
+                (By.CSS_SELECTOR, "input[id*='meuNumero']"),
+            ], dados['meu_numero'], log_fn=log)
+
+        # Valor
+        if dados.get('valor'):
+            preencher_campo(driver, WebDriverWait(driver, 10), [
+                (By.CSS_SELECTOR, "input[name*='valor']"),
+                (By.CSS_SELECTOR, "input[id*='valor']"),
+                (By.CSS_SELECTOR, "input[name*='vlrTitulo']"),
+                (By.CSS_SELECTOR, "input[name*='vlNominal']"),
+            ], dados['valor'], log_fn=log)
+
+        # Data de Vencimento
+        if dados.get('vencimento'):
+            preencher_campo(driver, WebDriverWait(driver, 10), [
+                (By.CSS_SELECTOR, "input[name*='vencimento']"),
+                (By.CSS_SELECTOR, "input[id*='vencimento']"),
+                (By.CSS_SELECTOR, "input[name*='dtVencimento']"),
+                (By.CSS_SELECTOR, "input[name*='dataVenc']"),
+            ], dados['vencimento'], log_fn=log)
+
+        # Nome do Pagador
+        if dados.get('nome_pagador'):
+            preencher_campo(driver, WebDriverWait(driver, 10), [
+                (By.CSS_SELECTOR, "input[name*='nomePagador']"),
+                (By.CSS_SELECTOR, "input[id*='nomePagador']"),
+                (By.CSS_SELECTOR, "input[name*='nome']"),
+                (By.CSS_SELECTOR, "input[id*='nomePag']"),
+            ], dados['nome_pagador'], log_fn=log)
+
+        # CPF / CNPJ
+        if dados.get('cpf_cnpj'):
+            preencher_campo(driver, WebDriverWait(driver, 10), [
+                (By.CSS_SELECTOR, "input[name*='cpfCnpj']"),
+                (By.CSS_SELECTOR, "input[id*='cpfCnpj']"),
+                (By.CSS_SELECTOR, "input[name*='cnpj']"),
+                (By.CSS_SELECTOR, "input[name*='cpf']"),
+                (By.CSS_SELECTOR, "input[id*='docPagador']"),
+            ], dados['cpf_cnpj'], log_fn=log)
+
+        # Endereço
+        if dados.get('endereco'):
+            preencher_campo(driver, WebDriverWait(driver, 10), [
+                (By.CSS_SELECTOR, "input[name*='endereco']"),
+                (By.CSS_SELECTOR, "input[id*='endereco']"),
+                (By.CSS_SELECTOR, "input[name*='logradouro']"),
+                (By.CSS_SELECTOR, "input[name*='endPagador']"),
+            ], dados['endereco'], log_fn=log)
+
+        # CEP
+        if dados.get('cep'):
+            preencher_campo(driver, WebDriverWait(driver, 10), [
+                (By.CSS_SELECTOR, "input[name*='cep']"),
+                (By.CSS_SELECTOR, "input[id*='cep']"),
+                (By.CSS_SELECTOR, "input[name*='cepPagador']"),
+            ], dados['cep'], log_fn=log)
+
+        # Instrução / Mensagem
+        if dados.get('mensagem_boleto_para_banco'):
+            preencher_campo(driver, WebDriverWait(driver, 10), [
+                (By.CSS_SELECTOR, "input[name*='instrucao']"),
+                (By.CSS_SELECTOR, "textarea[name*='instrucao']"),
+                (By.CSS_SELECTOR, "input[id*='instrucao']"),
+                (By.CSS_SELECTOR, "input[name*='mensagem']"),
+                (By.CSS_SELECTOR, "textarea[name*='mensagem']"),
+                (By.CSS_SELECTOR, "input[name*='obs']"),
+            ], dados['mensagem_boleto_para_banco'], log_fn=log)
+
+        # Espera visual para o usuário ver o preenchimento
+        time.sleep(1)
+
+        log("")
+        log("━" * 50)
+        log("✅ DADOS PREENCHIDOS COM SUCESSO!")
+        log("━" * 50)
+        log("👉 O navegador está aberto e aguardando.")
+        log("   Revise os campos, ajuste se necessário")
+        log("   e clique em CONFIRMAR / EMITIR no site.")
+        log("━" * 50)
+
+        # O driver permanece aberto — NÃO chama driver.quit()
+        # O processo Streamlit mantém a referência para não fechar o Chrome
+        st.session_state['driver_aberto'] = driver
+        return True, "Navegador aberto com os dados preenchidos. Confirme a emissão no Chrome."
 
     except Exception as e:
-        return False, f"❌ Erro ao preencher/submeter formulário: {e}", None
-
-
-def gerar_boleto_bradesco_requests(
-    login: str,
-    senha: str,
-    dados: dict,
-    log_fn=None
-) -> tuple[bool, str, bytes | None]:
-    """
-    Orquestra todo o fluxo de geração de boleto via requests puras:
-    login → cobrança → emissão → download PDF.
-    """
-    def log(msg):
-        if log_fn:
-            log_fn(msg)
-
-    # Passo 1 — Login
-    session, msg_login, soup_home = login_bradesco(login, senha, log_fn=log)
-    if not session:
-        return False, msg_login, None
-
-    url_home = BRADESCO_LOGIN_URL  # ponto de partida para Referer
-
-    # Passo 2 — Cobrança
-    ok, msg, soup_cobranca, url_cobranca = navegar_para_cobranca(
-        session, soup_home, url_home, log_fn=log
-    )
-    if not ok:
-        return False, msg, None
-
-    # Passo 3 — Tela de emissão
-    ok, msg, soup_emissao, url_emissao = navegar_para_emissao_boleto(
-        session, soup_cobranca, url_cobranca, log_fn=log
-    )
-    if not ok:
-        return False, msg, None
-
-    # Passo 4 — Preenche e submete
-    ok, msg, pdf_bytes = preencher_e_submeter_boleto(
-        session, soup_emissao, url_emissao, dados, log_fn=log
-    )
-    return ok, msg, pdf_bytes
-
-
-def exibir_download_pdf(pdf_bytes: bytes, nome_arquivo: str = "boleto.pdf"):
-    """Renderiza botão de download do PDF no Streamlit."""
-    b64 = base64.b64encode(pdf_bytes).decode()
-    href = (
-        f'<a href="data:application/pdf;base64,{b64}" '
-        f'download="{nome_arquivo}" '
-        f'style="display:inline-block;padding:10px 22px;background:#1a6e1a;'
-        f'color:white;text-decoration:none;border-radius:6px;font-weight:bold;">'
-        f'📥 Baixar Boleto PDF</a>'
-    )
-    st.markdown(href, unsafe_allow_html=True)
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+        return False, f"❌ Erro durante a automação: {e}"
 
 
 # ============================================================
@@ -700,9 +550,9 @@ with st.sidebar:
 
         selected_process = None
         if selected_process_display != "Selecione um processo...":
-            match = re.match(r'(\d+)', selected_process_display)
-            if match:
-                num = match.group(1)
+            m = re.match(r'(\d+)', selected_process_display)
+            if m:
+                num = m.group(1)
                 for p in st.session_state['processos_listados']:
                     if p.get('n_do_processo') == num:
                         selected_process = p
@@ -719,7 +569,7 @@ with st.sidebar:
 # ============================================================
 
 if 'selected_process' in st.session_state and st.session_state['selected_process']:
-    processo = st.session_state['selected_process']
+    processo   = st.session_state['selected_process']
     processo_id = processo.get('id_boleto')
 
     if processo_id and 'session' in st.session_state and st.session_state['session']:
@@ -741,117 +591,5 @@ if 'selected_process' in st.session_state and st.session_state['selected_process
 
         if detalhes:
 
-            # ── STATUS DO BOLETO NO SISGAT ──────────────────────────
-            st.subheader("📎 Status do Boleto no SISGAT")
+            # ── STATUS DO BOLETO ────────────────────────────────────
 
-            boleto_texto = detalhes.get('boleto_anexado_texto')
-            boleto_href  = detalhes.get('boleto_anexado_href')
-            boleto_vazio = not boleto_texto or boleto_texto.strip() in ('', '-', 'N/A', 'Não informado', 'Nenhum')
-
-            if not boleto_vazio:
-                # ── BOLETO JÁ ANEXADO ───────────────────────────────
-                st.success("✅ **Boleto já está anexado no SISGAT.** Não é necessário gerar um novo.")
-
-                col_b1, col_b2 = st.columns([3, 1])
-                with col_b1:
-                    st.info(f"Arquivo identificado: **{boleto_texto}**")
-                with col_b2:
-                    if boleto_href:
-                        url_download = (
-                            boleto_href if boleto_href.startswith('http')
-                            else f"{SISGAT_URL_BASE}{boleto_href}"
-                        )
-                        st.markdown(
-                            f'<a href="{url_download}" target="_blank" '
-                            f'style="display:inline-block;padding:8px 16px;'
-                            f'background:#1a6e1a;color:white;text-decoration:none;'
-                            f'border-radius:5px;font-weight:bold;">📄 Abrir Boleto</a>',
-                            unsafe_allow_html=True
-                        )
-
-            else:
-                # ── BOLETO NÃO ANEXADO — GERAR VIA BRADESCO ─────────
-                st.error("❌ **Boleto NÃO está anexado no SISGAT.**")
-                st.warning("Preencha a data de vencimento e clique em **Gerar Boleto** para emitir via Bradesco Net Empresa.")
-
-                col_cfg1, col_cfg2 = st.columns(2)
-                with col_cfg1:
-                    data_vencimento = st.date_input("📅 Data de Vencimento", key="data_venc")
-                with col_cfg2:
-                    st.text_input("💰 Valor (R$)", value=detalhes.get('valor', ''), disabled=True)
-
-                with st.expander("📋 Dados que serão inseridos no boleto", expanded=True):
-                    col_d1, col_d2 = st.columns(2)
-                    with col_d1:
-                        st.write(f"**Pagador:** {detalhes.get('nome_pagador', 'N/A')}")
-                        st.write(f"**CPF/CNPJ:** {detalhes.get('cpf_cnpj', 'N/A')}")
-                        st.write(f"**Endereço:** {detalhes.get('endereco', 'N/A')}")
-                        st.write(f"**CEP:** {detalhes.get('cep', 'N/A')}")
-                    with col_d2:
-                        st.write(f"**Processo:** {detalhes.get('numero_processo', 'N/A')}")
-                        st.write(f"**Tipo de Taxa:** {detalhes.get('tipo_taxa_solicitada', 'N/A')}")
-                        st.write(f"**Meu Número:** {detalhes.get('meu_numero', 'N/A')}")
-                        st.write(f"**Mensagem:** {detalhes.get('mensagem_boleto_para_banco', 'N/A')}")
-
-                if st.button("🏦 Gerar Boleto no Bradesco", type="primary", use_container_width=True):
-                    logs_gerados = []
-                    log_placeholder = st.empty()
-
-                    def atualizar_log(msg):
-                        logs_gerados.append(msg)
-                        log_placeholder.markdown(
-                            "<br>".join(logs_gerados),
-                            unsafe_allow_html=True
-                        )
-
-                    dados_boleto = {
-                        **detalhes,
-                        "vencimento": data_vencimento.strftime("%d/%m/%Y"),
-                    }
-
-                    with st.spinner("Gerando boleto via Bradesco Net Empresa..."):
-                        sucesso, mensagem, pdf_bytes = gerar_boleto_bradesco_requests(
-                            login=st.session_state.get('bradesco_login', ''),
-                            senha=st.session_state.get('bradesco_senha', ''),
-                            dados=dados_boleto,
-                            log_fn=atualizar_log,
-                        )
-
-                    st.markdown("---")
-                    if sucesso and pdf_bytes:
-                        st.success(mensagem)
-                        st.balloons()
-                        nome_pdf = f"boleto_{detalhes.get('numero_processo', processo_id)}.pdf"
-                        exibir_download_pdf(pdf_bytes, nome_arquivo=nome_pdf)
-                    else:
-                        st.error(mensagem)
-                        st.markdown(
-                            "**Acesso manual:** "
-                            "[Bradesco Net Empresa ↗](https://www.ne2.bradesconetempresa.b.br/ibpjlogin/login.jsf)"
-                        )
-
-            st.markdown("---")
-
-            # ── DETALHES COMPLETOS ──────────────────────────────────
-            with st.expander("🗂️ Detalhes Completos do Processo", expanded=False):
-                campos_ocultos = {'boleto_anexado_texto', 'boleto_anexado_href'}
-                items = [(k, v) for k, v in detalhes.items() if k not in campos_ocultos]
-                col_e1, col_e2 = st.columns(2)
-                metade = len(items) // 2
-                with col_e1:
-                    for k, v in items[:metade]:
-                        st.write(f"**{k.replace('_', ' ').title()}:** {v}")
-                with col_e2:
-                    for k, v in items[metade:]:
-                        st.write(f"**{k.replace('_', ' ').title()}:** {v}")
-
-        else:
-            st.warning(f"Não foi possível carregar os detalhes para o Processo ID: {processo_id}.")
-
-    else:
-        st.warning("Selecione um processo válido na barra lateral.")
-
-elif 'login_status' in st.session_state and st.session_state.get('login_status') != "Login bem-sucedido!":
-    st.error("Por favor, faça o login na barra lateral para carregar os processos.")
-else:
-    st.info("👈 Faça o login na barra lateral e selecione um processo para começar.")
