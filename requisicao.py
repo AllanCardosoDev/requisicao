@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
@@ -125,7 +126,10 @@ def obter_detalhes_boleto_sisgat(session, boleto_id, url_base="https://sisgat.cb
                 pass
             return None
 
-        h3_element = soup.find('h3', string=lambda text: text and 'Visualização de Solicitação de Boleto para o Processo Nº' in text)
+        h3_element = soup.find(
+            'h3',
+            string=lambda text: text and 'Visualização de Solicitação de Boleto para o Processo Nº' in text
+        )
         if h3_element:
             span = h3_element.find('span', style=lambda s: s and 'font-size:2rem; color:red;' in s)
             if span:
@@ -190,12 +194,38 @@ BRADESCO_LOGIN_URL = f"{BRADESCO_URL_BASE}/ibpjlogin/login.jsf"
 def criar_driver():
     options = Options()
     options.add_argument("--start-maximized")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
 
-    service = Service(ChromeDriverManager().install())
-    driver  = webdriver.Chrome(service=service, options=options)
+    # Caminhos possíveis do Chromium no Linux (Streamlit Cloud / Debian / Ubuntu)
+    possiveis_chrome = [
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+    ]
+    possiveis_driver = [
+        "/usr/bin/chromedriver",
+        "/usr/lib/chromium/chromedriver",
+        "/usr/lib/chromium-browser/chromedriver",
+    ]
+
+    chrome_bin = next((p for p in possiveis_chrome if os.path.exists(p)), None)
+    driver_bin = next((p for p in possiveis_driver if os.path.exists(p)), None)
+
+    if chrome_bin:
+        options.binary_location = chrome_bin
+
+    if driver_bin:
+        service = Service(executable_path=driver_bin)
+    else:
+        service = Service(ChromeDriverManager().install())
+
+    driver = webdriver.Chrome(service=service, options=options)
     driver.execute_script(
         "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
     )
@@ -231,7 +261,7 @@ def abrir_bradesco_e_preencher(login: str, senha: str, dados: dict, log_fn=None)
         driver = criar_driver()
 
         # ── LOGIN ───────────────────────────────────────────────────
-        log(f"🔑 Acessando página de login...")
+        log("🔑 Acessando página de login...")
         driver.get(BRADESCO_LOGIN_URL)
         time.sleep(2)
 
@@ -279,7 +309,8 @@ def abrir_bradesco_e_preencher(login: str, senha: str, dados: dict, log_fn=None)
         try:
             menu = WebDriverWait(driver, 15).until(EC.element_to_be_clickable((
                 By.XPATH,
-                "//*[contains(text(),'Cobrança') or contains(text(),'cobrança') or contains(text(),'COBRANÇA')]"
+                "//*[contains(text(),'Cobrança') or contains(text(),'cobrança') "
+                "or contains(text(),'COBRANÇA')]"
             )))
             menu.click()
             time.sleep(2)
@@ -390,7 +421,6 @@ def abrir_bradesco_e_preencher(login: str, senha: str, dados: dict, log_fn=None)
         log("   CONFIRMAR / EMITIR para gerar o boleto.")
         log("━" * 50)
 
-        # Mantém o driver aberto na session_state
         st.session_state['driver_aberto'] = driver
         return True, "✅ Navegador aberto com os dados preenchidos."
 
@@ -491,7 +521,6 @@ if 'selected_process' in st.session_state and st.session_state['selected_process
 
     if processo_id and 'session' in st.session_state and st.session_state['session']:
 
-        # Cabeçalho
         col1, col2, col3 = st.columns(3)
         with col1:
             st.metric("Nº do Processo", processo.get('n_do_processo', 'N/A'))
@@ -502,7 +531,6 @@ if 'selected_process' in st.session_state and st.session_state['selected_process
 
         st.markdown("---")
 
-        # Detalhes do processo
         with st.spinner("Carregando detalhes..."):
             detalhes = obter_detalhes_boleto_sisgat(
                 st.session_state['session'], processo_id, SISGAT_URL_BASE
@@ -534,7 +562,6 @@ if 'selected_process' in st.session_state and st.session_state['selected_process
 
             if st.button("🏦 Abrir Bradesco e Preencher Dados", type="primary", use_container_width=True):
 
-                # Fecha driver anterior se existir
                 if st.session_state.get('driver_aberto'):
                     try:
                         st.session_state['driver_aberto'].quit()
@@ -570,7 +597,8 @@ if 'selected_process' in st.session_state and st.session_state['selected_process
                     st.success(mensagem)
                     st.info(
                         "🖥️ O Chrome está aberto com os dados preenchidos. "
-                        "Revise as informações e clique em **Confirmar / Emitir** no site do Bradesco."
+                        "Revise as informações e clique em **Confirmar / Emitir** "
+                        "no site do Bradesco."
                     )
                 else:
                     st.error(mensagem)
@@ -583,8 +611,8 @@ if 'selected_process' in st.session_state and st.session_state['selected_process
 
             # ── DETALHES COMPLETOS ──────────────────────────────────
             with st.expander("🗂️ Detalhes Completos do Processo", expanded=False):
-                items   = list(detalhes.items())
-                metade  = len(items) // 2
+                items  = list(detalhes.items())
+                metade = len(items) // 2
                 col_e1, col_e2 = st.columns(2)
                 with col_e1:
                     for k, v in items[:metade]:
