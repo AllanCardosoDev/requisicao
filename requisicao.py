@@ -3,11 +3,12 @@ import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 import re
+import json
 import time
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait, Select
+from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -184,24 +185,186 @@ def obter_detalhes_boleto_sisgat(session, boleto_id, url_base="https://sisgat.cb
 
 
 # ============================================================
-# AUTOMAÇÃO BRADESCO — SELENIUM
+# INSPEÇÃO BRADESCO — REQUESTS PURAS
 # ============================================================
 
 BRADESCO_URL_BASE  = "https://www.ne2.bradesconetempresa.b.br"
 BRADESCO_LOGIN_URL = f"{BRADESCO_URL_BASE}/ibpjlogin/login.jsf"
 
+HEADERS_BRADESCO = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/124.0.0.0 Safari/537.36'
+    ),
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'pt-BR,pt;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+}
+
+
+def inspecionar_bradesco(login: str, senha: str) -> dict:
+    """
+    Faz GET e POST no Bradesco via requests puras e retorna
+    um dicionário com tudo que foi encontrado em cada etapa.
+    """
+    resultado = {}
+    session   = requests.Session()
+
+    # ── PASSO 1: GET na página de login ────────────────────────
+    try:
+        resp_get = session.get(
+            BRADESCO_LOGIN_URL,
+            headers=HEADERS_BRADESCO,
+            timeout=30
+        )
+        soup = BeautifulSoup(resp_get.text, 'html.parser')
+
+        resultado['passo1_status']       = resp_get.status_code
+        resultado['passo1_url_final']    = resp_get.url
+        resultado['passo1_content_type'] = resp_get.headers.get('Content-Type', '')
+        resultado['passo1_html']         = resp_get.text
+
+        # Cookies
+        resultado['passo1_cookies'] = {
+            c.name: c.value for c in session.cookies
+        }
+
+        # Formulários
+        forms = []
+        for form in soup.find_all('form'):
+            forms.append({
+                'id':     form.get('id'),
+                'action': form.get('action'),
+                'method': form.get('method'),
+            })
+        resultado['passo1_forms'] = forms
+
+        # Todos os inputs
+        inputs = []
+        for inp in soup.find_all('input'):
+            inputs.append({
+                'type':  inp.get('type', 'text'),
+                'name':  inp.get('name'),
+                'id':    inp.get('id'),
+                'value': str(inp.get('value', ''))[:100],
+            })
+        resultado['passo1_inputs'] = inputs
+
+        # Campos hidden
+        hidden = {}
+        for inp in soup.find_all('input', {'type': 'hidden'}):
+            nome = inp.get('name') or inp.get('id')
+            if nome:
+                hidden[nome] = inp.get('value', '')
+        resultado['passo1_hidden'] = hidden
+
+    except Exception as e:
+        resultado['passo1_erro'] = str(e)
+        return resultado
+
+    # ── PASSO 2: POST com credenciais ──────────────────────────
+    try:
+        form_principal = soup.find('form')
+        action_url     = form_principal.get('action') if form_principal else None
+        if action_url and action_url.startswith('/'):
+            action_url = f"{BRADESCO_URL_BASE}{action_url}"
+        action_url = action_url or BRADESCO_LOGIN_URL
+
+        resultado['passo2_action_url'] = action_url
+
+        # Identifica campos de usuário e senha
+        campo_usuario = None
+        campo_senha   = None
+        for inp in soup.find_all('input'):
+            name = (inp.get('name') or '').lower()
+            id_  = (inp.get('id')   or '').lower()
+            tipo = (inp.get('type') or 'text').lower()
+            if tipo not in ('hidden', 'submit', 'button', 'checkbox', 'radio'):
+                if any(p in name or p in id_ for p in ['user', 'login', 'cpf', 'usuario', 'agencia', 'conta']):
+                    campo_usuario = inp.get('name') or inp.get('id')
+                if any(p in name or p in id_ for p in ['senha', 'pass', 'pwd', 'password']):
+                    campo_senha = inp.get('name') or inp.get('id')
+
+        resultado['passo2_campo_usuario'] = campo_usuario
+        resultado['passo2_campo_senha']   = campo_senha
+
+        payload = {**hidden}
+        payload[campo_usuario or 'j_username'] = login
+        payload[campo_senha   or 'j_password'] = senha
+
+        btn = soup.find('input', {'type': 'submit'}) or soup.find('button', {'type': 'submit'})
+        if btn:
+            btn_name  = btn.get('name')
+            btn_value = btn.get('value', 'Entrar')
+            if btn_name:
+                payload[btn_name] = btn_value
+
+        resultado['passo2_payload'] = payload
+
+        resp_post = session.post(
+            action_url,
+            data=payload,
+            headers={**HEADERS_BRADESCO, 'Referer': BRADESCO_LOGIN_URL},
+            allow_redirects=True,
+            timeout=30
+        )
+
+        resultado['passo2_status']       = resp_post.status_code
+        resultado['passo2_url_final']    = resp_post.url
+        resultado['passo2_content_type'] = resp_post.headers.get('Content-Type', '')
+        resultado['passo2_html']         = resp_post.text
+        resultado['passo2_headers']      = dict(resp_post.headers)
+
+        resultado['passo2_cookies'] = {
+            c.name: c.value for c in session.cookies
+        }
+
+        soup_pos = BeautifulSoup(resp_post.text, 'html.parser')
+
+        links = []
+        for a in soup_pos.find_all('a', href=True):
+            texto = a.get_text(strip=True)
+            if texto:
+                links.append({'texto': texto, 'href': a['href']})
+        resultado['passo2_links'] = links
+
+        forms_pos = []
+        for form in soup_pos.find_all('form'):
+            forms_pos.append({
+                'id':     form.get('id'),
+                'action': form.get('action'),
+                'method': form.get('method'),
+            })
+        resultado['passo2_forms'] = forms_pos
+
+    except Exception as e:
+        resultado['passo2_erro'] = str(e)
+
+    return resultado
+
+
+# ============================================================
+# AUTOMAÇÃO BRADESCO — SELENIUM
+# ============================================================
 
 def criar_driver():
     options = Options()
-    options.add_argument("--start-maximized")
+    options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-setuid-sandbox")
+    options.add_argument("--single-process")
+    options.add_argument("--remote-debugging-port=9222")
+    options.add_argument("--window-size=1366,768")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
 
-    # Caminhos possíveis do Chromium no Linux (Streamlit Cloud / Debian / Ubuntu)
     possiveis_chrome = [
         "/usr/bin/chromium",
         "/usr/bin/chromium-browser",
@@ -246,7 +409,7 @@ def preencher_campo(driver, seletores: list, valor: str, log_fn=None):
         except Exception:
             continue
     if log_fn:
-        log_fn(f"   ⚠️  Campo não encontrado para valor '{str(valor)[:40]}'")
+        log_fn(f"   ⚠️  Campo não encontrado para '{str(valor)[:40]}'")
     return False
 
 
@@ -257,10 +420,9 @@ def abrir_bradesco_e_preencher(login: str, senha: str, dados: dict, log_fn=None)
 
     driver = None
     try:
-        log("🌐 Abrindo Chrome...")
+        log("🌐 Iniciando Chrome...")
         driver = criar_driver()
 
-        # ── LOGIN ───────────────────────────────────────────────────
         log("🔑 Acessando página de login...")
         driver.get(BRADESCO_LOGIN_URL)
         time.sleep(2)
@@ -293,18 +455,17 @@ def abrir_bradesco_e_preencher(login: str, senha: str, dados: dict, log_fn=None)
             btn.click()
         except TimeoutException:
             driver.execute_script(
-                "var btn = document.querySelector('input[type=submit], button[type=submit]');"
-                "if(btn) btn.click();"
+                "var b = document.querySelector('input[type=submit],button[type=submit]');"
+                "if(b) b.click();"
             )
 
         time.sleep(3)
 
         if "login" in driver.current_url.lower():
-            return False, "❌ Login falhou. Verifique as credenciais ou se o site exige certificado/token físico."
+            return False, "❌ Login falhou. Verifique as credenciais."
 
-        log("✅ Login realizado. URL: " + driver.current_url)
+        log("✅ Login realizado: " + driver.current_url)
 
-        # ── COBRANÇA ────────────────────────────────────────────────
         log("📂 Navegando para Cobrança...")
         try:
             menu = WebDriverWait(driver, 15).until(EC.element_to_be_clickable((
@@ -314,13 +475,11 @@ def abrir_bradesco_e_preencher(login: str, senha: str, dados: dict, log_fn=None)
             )))
             menu.click()
             time.sleep(2)
-            log("✅ Cobrança acessada.")
         except TimeoutException:
             log("⚠️  Menu não encontrado. Tentando URL direta...")
             driver.get(f"{BRADESCO_URL_BASE}/ibpjcobranca/cobranca.jsf")
             time.sleep(2)
 
-        # ── EMITIR BOLETO ───────────────────────────────────────────
         log("📄 Navegando para Emitir Boleto...")
         try:
             emitir = WebDriverWait(driver, 15).until(EC.element_to_be_clickable((
@@ -330,16 +489,13 @@ def abrir_bradesco_e_preencher(login: str, senha: str, dados: dict, log_fn=None)
             )))
             emitir.click()
             time.sleep(2)
-            log("✅ Tela de emissão acessada.")
         except TimeoutException:
             log("⚠️  Link não encontrado. Tentando URL direta...")
             driver.get(f"{BRADESCO_URL_BASE}/ibpjcobranca/emissaoBoleto.jsf")
             time.sleep(2)
 
         log(f"📍 Página atual: {driver.current_url}")
-
-        # ── PREENCHER CAMPOS ────────────────────────────────────────
-        log("✏️  Preenchendo dados do boleto...")
+        log("✏️  Preenchendo dados...")
 
         if dados.get('meu_numero'):
             log("→ Nosso Número")
@@ -369,7 +525,7 @@ def abrir_bradesco_e_preencher(login: str, senha: str, dados: dict, log_fn=None)
             ], dados['vencimento'], log_fn=log)
 
         if dados.get('nome_pagador'):
-            log("→ Nome do Pagador")
+            log("→ Nome Pagador")
             preencher_campo(driver, [
                 (By.CSS_SELECTOR, "input[name*='nomePagador']"),
                 (By.CSS_SELECTOR, "input[id*='nomePagador']"),
@@ -413,12 +569,10 @@ def abrir_bradesco_e_preencher(login: str, senha: str, dados: dict, log_fn=None)
             ], dados['mensagem_boleto_para_banco'], log_fn=log)
 
         time.sleep(1)
-
         log("")
         log("━" * 50)
         log("✅ DADOS PREENCHIDOS!")
-        log("👉 Revise os campos no Chrome e clique em")
-        log("   CONFIRMAR / EMITIR para gerar o boleto.")
+        log("👉 Revise os campos e clique em CONFIRMAR / EMITIR.")
         log("━" * 50)
 
         st.session_state['driver_aberto'] = driver
@@ -512,122 +666,209 @@ with st.sidebar:
 
 
 # ============================================================
-# ÁREA PRINCIPAL
+# ÁREA PRINCIPAL — ABAS
 # ============================================================
 
-if 'selected_process' in st.session_state and st.session_state['selected_process']:
-    processo    = st.session_state['selected_process']
-    processo_id = processo.get('id_boleto')
+aba_principal, aba_inspecao = st.tabs([
+    "📋 Gestão de Boletos",
+    "🔍 Inspecionar Site Bradesco"
+])
 
-    if processo_id and 'session' in st.session_state and st.session_state['session']:
 
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Nº do Processo", processo.get('n_do_processo', 'N/A'))
-        with col2:
-            st.metric("Cliente", processo.get('cliente', 'N/A'))
-        with col3:
-            st.metric("Tipo de Taxa", processo.get('tipo_de_taxa', 'N/A'))
+# ── ABA PRINCIPAL ───────────────────────────────────────────
+with aba_principal:
 
-        st.markdown("---")
+    if 'selected_process' in st.session_state and st.session_state['selected_process']:
+        processo    = st.session_state['selected_process']
+        processo_id = processo.get('id_boleto')
 
-        with st.spinner("Carregando detalhes..."):
-            detalhes = obter_detalhes_boleto_sisgat(
-                st.session_state['session'], processo_id, SISGAT_URL_BASE
-            )
+        if processo_id and 'session' in st.session_state and st.session_state['session']:
 
-        if detalhes:
-
-            # ── ETAPA 2 — GERAR BOLETO NO BRADESCO ─────────────────
-            st.subheader("🏦 Etapa 2 — Gerar Boleto no Bradesco")
-
-            col_cfg1, col_cfg2 = st.columns(2)
-            with col_cfg1:
-                data_vencimento = st.date_input("📅 Data de Vencimento", key="data_venc")
-            with col_cfg2:
-                st.text_input("💰 Valor (R$)", value=detalhes.get('valor', ''), disabled=True)
-
-            with st.expander("📋 Dados que serão preenchidos no boleto", expanded=False):
-                col_d1, col_d2 = st.columns(2)
-                with col_d1:
-                    st.write(f"**Pagador:** {detalhes.get('nome_pagador', 'N/A')}")
-                    st.write(f"**CPF/CNPJ:** {detalhes.get('cpf_cnpj', 'N/A')}")
-                    st.write(f"**Endereço:** {detalhes.get('endereco', 'N/A')}")
-                    st.write(f"**CEP:** {detalhes.get('cep', 'N/A')}")
-                with col_d2:
-                    st.write(f"**Processo:** {detalhes.get('numero_processo', 'N/A')}")
-                    st.write(f"**Tipo de Taxa:** {detalhes.get('tipo_taxa_solicitada', 'N/A')}")
-                    st.write(f"**Meu Número:** {detalhes.get('meu_numero', 'N/A')}")
-                    st.write(f"**Mensagem:** {detalhes.get('mensagem_boleto_para_banco', 'N/A')}")
-
-            if st.button("🏦 Abrir Bradesco e Preencher Dados", type="primary", use_container_width=True):
-
-                if st.session_state.get('driver_aberto'):
-                    try:
-                        st.session_state['driver_aberto'].quit()
-                    except Exception:
-                        pass
-                    st.session_state['driver_aberto'] = None
-
-                logs_gerados    = []
-                log_placeholder = st.empty()
-
-                def atualizar_log(msg):
-                    logs_gerados.append(msg)
-                    log_placeholder.markdown(
-                        "<br>".join(logs_gerados),
-                        unsafe_allow_html=True
-                    )
-
-                dados_boleto = {
-                    **detalhes,
-                    "vencimento": data_vencimento.strftime("%d/%m/%Y"),
-                }
-
-                with st.spinner("Abrindo navegador e preenchendo dados..."):
-                    sucesso, mensagem = abrir_bradesco_e_preencher(
-                        login=st.session_state.get('bradesco_login', ''),
-                        senha=st.session_state.get('bradesco_senha', ''),
-                        dados=dados_boleto,
-                        log_fn=atualizar_log,
-                    )
-
-                st.markdown("---")
-                if sucesso:
-                    st.success(mensagem)
-                    st.info(
-                        "🖥️ O Chrome está aberto com os dados preenchidos. "
-                        "Revise as informações e clique em **Confirmar / Emitir** "
-                        "no site do Bradesco."
-                    )
-                else:
-                    st.error(mensagem)
-                    st.markdown(
-                        "**Acesso manual:** "
-                        "[Bradesco Net Empresa ↗](https://www.ne2.bradesconetempresa.b.br/ibpjlogin/login.jsf)"
-                    )
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Nº do Processo", processo.get('n_do_processo', 'N/A'))
+            with col2:
+                st.metric("Cliente", processo.get('cliente', 'N/A'))
+            with col3:
+                st.metric("Tipo de Taxa", processo.get('tipo_de_taxa', 'N/A'))
 
             st.markdown("---")
 
-            # ── DETALHES COMPLETOS ──────────────────────────────────
-            with st.expander("🗂️ Detalhes Completos do Processo", expanded=False):
-                items  = list(detalhes.items())
-                metade = len(items) // 2
-                col_e1, col_e2 = st.columns(2)
-                with col_e1:
-                    for k, v in items[:metade]:
-                        st.write(f"**{k.replace('_', ' ').title()}:** {v}")
-                with col_e2:
-                    for k, v in items[metade:]:
-                        st.write(f"**{k.replace('_', ' ').title()}:** {v}")
+            with st.spinner("Carregando detalhes..."):
+                detalhes = obter_detalhes_boleto_sisgat(
+                    st.session_state['session'], processo_id, SISGAT_URL_BASE
+                )
+
+            if detalhes:
+
+                st.subheader("🏦 Etapa 2 — Gerar Boleto no Bradesco")
+
+                col_cfg1, col_cfg2 = st.columns(2)
+                with col_cfg1:
+                    data_vencimento = st.date_input("📅 Data de Vencimento", key="data_venc")
+                with col_cfg2:
+                    st.text_input("💰 Valor (R$)", value=detalhes.get('valor', ''), disabled=True)
+
+                with st.expander("📋 Dados que serão preenchidos no boleto", expanded=False):
+                    col_d1, col_d2 = st.columns(2)
+                    with col_d1:
+                        st.write(f"**Pagador:** {detalhes.get('nome_pagador', 'N/A')}")
+                        st.write(f"**CPF/CNPJ:** {detalhes.get('cpf_cnpj', 'N/A')}")
+                        st.write(f"**Endereço:** {detalhes.get('endereco', 'N/A')}")
+                        st.write(f"**CEP:** {detalhes.get('cep', 'N/A')}")
+                    with col_d2:
+                        st.write(f"**Processo:** {detalhes.get('numero_processo', 'N/A')}")
+                        st.write(f"**Tipo de Taxa:** {detalhes.get('tipo_taxa_solicitada', 'N/A')}")
+                        st.write(f"**Meu Número:** {detalhes.get('meu_numero', 'N/A')}")
+                        st.write(f"**Mensagem:** {detalhes.get('mensagem_boleto_para_banco', 'N/A')}")
+
+                if st.button("🏦 Abrir Bradesco e Preencher Dados", type="primary", use_container_width=True):
+
+                    if st.session_state.get('driver_aberto'):
+                        try:
+                            st.session_state['driver_aberto'].quit()
+                        except Exception:
+                            pass
+                        st.session_state['driver_aberto'] = None
+
+                    logs_gerados    = []
+                    log_placeholder = st.empty()
+
+                    def atualizar_log(msg):
+                        logs_gerados.append(msg)
+                        log_placeholder.markdown(
+                            "<br>".join(logs_gerados),
+                            unsafe_allow_html=True
+                        )
+
+                    dados_boleto = {
+                        **detalhes,
+                        "vencimento": data_vencimento.strftime("%d/%m/%Y"),
+                    }
+
+                    with st.spinner("Abrindo navegador e preenchendo dados..."):
+                        sucesso, mensagem = abrir_bradesco_e_preencher(
+                            login=st.session_state.get('bradesco_login', ''),
+                            senha=st.session_state.get('bradesco_senha', ''),
+                            dados=dados_boleto,
+                            log_fn=atualizar_log,
+                        )
+
+                    st.markdown("---")
+                    if sucesso:
+                        st.success(mensagem)
+                        st.info(
+                            "🖥️ O Chrome está aberto com os dados preenchidos. "
+                            "Revise e clique em **Confirmar / Emitir** no Bradesco."
+                        )
+                    else:
+                        st.error(mensagem)
+                        st.markdown(
+                            "**Acesso manual:** "
+                            "[Bradesco Net Empresa ↗](https://www.ne2.bradesconetempresa.b.br/ibpjlogin/login.jsf)"
+                        )
+
+                st.markdown("---")
+
+                with st.expander("🗂️ Detalhes Completos do Processo", expanded=False):
+                    items  = list(detalhes.items())
+                    metade = len(items) // 2
+                    col_e1, col_e2 = st.columns(2)
+                    with col_e1:
+                        for k, v in items[:metade]:
+                            st.write(f"**{k.replace('_', ' ').title()}:** {v}")
+                    with col_e2:
+                        for k, v in items[metade:]:
+                            st.write(f"**{k.replace('_', ' ').title()}:** {v}")
+
+            else:
+                st.warning(f"Não foi possível carregar os detalhes para o Processo ID: {processo_id}.")
 
         else:
-            st.warning(f"Não foi possível carregar os detalhes para o Processo ID: {processo_id}.")
+            st.warning("Selecione um processo válido na barra lateral.")
 
+    elif 'login_status' in st.session_state and st.session_state.get('login_status') != "Login bem-sucedido!":
+        st.error("Por favor, faça o login na barra lateral para carregar os processos.")
     else:
-        st.warning("Selecione um processo válido na barra lateral.")
+        st.info("👈 Faça o login na barra lateral e selecione um processo para começar.")
 
-elif 'login_status' in st.session_state and st.session_state.get('login_status') != "Login bem-sucedido!":
-    st.error("Por favor, faça o login na barra lateral para carregar os processos.")
-else:
-    st.info("👈 Faça o login na barra lateral e selecione um processo para começar.")
+
+# ── ABA DE INSPEÇÃO ─────────────────────────────────────────
+with aba_inspecao:
+    st.subheader("🔍 Inspecionar Site do Bradesco via Requests")
+    st.caption(
+        "Faz GET e POST no Bradesco sem abrir o Chrome. "
+        "Use o resultado para mapear os campos reais do formulário JSF."
+    )
+
+    col_i1, col_i2 = st.columns(2)
+    with col_i1:
+        ins_login = st.text_input("Login Bradesco", value="mpps00033", key="ins_login")
+    with col_i2:
+        ins_senha = st.text_input("Senha Bradesco", type="password", value="832cbmam", key="ins_senha")
+
+    if st.button("🔎 Inspecionar Agora", type="primary", use_container_width=True):
+        with st.spinner("Fazendo requisições ao Bradesco..."):
+            resultado = inspecionar_bradesco(ins_login, ins_senha)
+
+        st.markdown("---")
+
+        # ── PASSO 1
+        st.markdown("### Passo 1 — GET na página de login")
+        col_r1, col_r2 = st.columns(2)
+        with col_r1:
+            st.write(f"**Status:** {resultado.get('passo1_status')}")
+            st.write(f"**URL final:** {resultado.get('passo1_url_final')}")
+            st.write(f"**Content-Type:** {resultado.get('passo1_content_type')}")
+        with col_r2:
+            st.write("**Cookies recebidos:**")
+            st.json(resultado.get('passo1_cookies', {}))
+
+        st.write("**Formulários encontrados:**")
+        st.json(resultado.get('passo1_forms', []))
+
+        st.write("**Todos os inputs:**")
+        st.json(resultado.get('passo1_inputs', []))
+
+        st.write("**Campos hidden (tokens JSF):**")
+        st.json(resultado.get('passo1_hidden', {}))
+
+        with st.expander("📄 HTML completo — Passo 1", expanded=False):
+            st.code(resultado.get('passo1_html', ''), language='html')
+
+        if 'passo1_erro' in resultado:
+            st.error(f"Erro no Passo 1: {resultado['passo1_erro']}")
+
+        st.markdown("---")
+
+        # ── PASSO 2
+        st.markdown("### Passo 2 — POST com credenciais")
+        col_r3, col_r4 = st.columns(2)
+        with col_r3:
+            st.write(f"**Status:** {resultado.get('passo2_status')}")
+            st.write(f"**URL final:** {resultado.get('passo2_url_final')}")
+            st.write(f"**Content-Type:** {resultado.get('passo2_content_type')}")
+            st.write(f"**Action URL usada:** {resultado.get('passo2_action_url')}")
+            st.write(f"**Campo usuário identificado:** `{resultado.get('passo2_campo_usuario')}`")
+            st.write(f"**Campo senha identificado:** `{resultado.get('passo2_campo_senha')}`")
+        with col_r4:
+            st.write("**Cookies após login:**")
+            st.json(resultado.get('passo2_cookies', {}))
+
+        st.write("**Payload enviado:**")
+        st.json(resultado.get('passo2_payload', {}))
+
+        st.write("**Links disponíveis pós-login:**")
+        st.json(resultado.get('passo2_links', []))
+
+        st.write("**Formulários pós-login:**")
+        st.json(resultado.get('passo2_forms', []))
+
+        st.write("**Headers da resposta:**")
+        st.json(resultado.get('passo2_headers', {}))
+
+        with st.expander("📄 HTML completo — Passo 2 (pós-login)", expanded=False):
+            st.code(resultado.get('passo2_html', ''), language='html')
+
+        if 'passo2_erro' in resultado:
+            st.error(f"Erro no Passo 2: {resultado['passo2_erro']}")
