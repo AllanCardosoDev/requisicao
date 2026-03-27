@@ -592,4 +592,129 @@ if 'selected_process' in st.session_state and st.session_state['selected_process
         if detalhes:
 
             # ── STATUS DO BOLETO ────────────────────────────────────
+            st.subheader("📎 Status do Boleto no SISGAT")
 
+            boleto_texto = detalhes.get('boleto_anexado_texto')
+            boleto_href  = detalhes.get('boleto_anexado_href')
+            boleto_vazio = not boleto_texto or boleto_texto.strip() in ('', '-', 'N/A', 'Não informado', 'Nenhum')
+
+            if not boleto_vazio:
+                # ── BOLETO JÁ ANEXADO ───────────────────────────────
+                st.success("✅ **Boleto já está anexado no SISGAT.** Não é necessário gerar um novo.")
+                col_b1, col_b2 = st.columns([3, 1])
+                with col_b1:
+                    st.info(f"Arquivo identificado: **{boleto_texto}**")
+                with col_b2:
+                    if boleto_href:
+                        url_download = (
+                            boleto_href if boleto_href.startswith('http')
+                            else f"{SISGAT_URL_BASE}{boleto_href}"
+                        )
+                        st.markdown(
+                            f'<a href="{url_download}" target="_blank" '
+                            f'style="display:inline-block;padding:8px 16px;'
+                            f'background:#1a6e1a;color:white;text-decoration:none;'
+                            f'border-radius:5px;font-weight:bold;">📄 Abrir Boleto</a>',
+                            unsafe_allow_html=True
+                        )
+
+            else:
+                # ── BOLETO NÃO ANEXADO — ABRIR BRADESCO ────────────
+                st.error("❌ **Boleto NÃO está anexado no SISGAT.**")
+                st.warning(
+                    "Clique no botão abaixo para abrir o Bradesco Net Empresa "
+                    "com todos os dados já preenchidos. Após revisar, clique em "
+                    "**Confirmar/Emitir** diretamente no navegador."
+                )
+
+                col_cfg1, col_cfg2 = st.columns(2)
+                with col_cfg1:
+                    data_vencimento = st.date_input("📅 Data de Vencimento", key="data_venc")
+                with col_cfg2:
+                    st.text_input("💰 Valor (R$)", value=detalhes.get('valor', ''), disabled=True)
+
+                with st.expander("📋 Dados que serão preenchidos no boleto", expanded=True):
+                    col_d1, col_d2 = st.columns(2)
+                    with col_d1:
+                        st.write(f"**Pagador:** {detalhes.get('nome_pagador', 'N/A')}")
+                        st.write(f"**CPF/CNPJ:** {detalhes.get('cpf_cnpj', 'N/A')}")
+                        st.write(f"**Endereço:** {detalhes.get('endereco', 'N/A')}")
+                        st.write(f"**CEP:** {detalhes.get('cep', 'N/A')}")
+                    with col_d2:
+                        st.write(f"**Processo:** {detalhes.get('numero_processo', 'N/A')}")
+                        st.write(f"**Tipo de Taxa:** {detalhes.get('tipo_taxa_solicitada', 'N/A')}")
+                        st.write(f"**Meu Número:** {detalhes.get('meu_numero', 'N/A')}")
+                        st.write(f"**Mensagem:** {detalhes.get('mensagem_boleto_para_banco', 'N/A')}")
+
+                if st.button("🏦 Abrir Bradesco e Preencher Dados", type="primary", use_container_width=True):
+
+                    # Fecha driver anterior se ainda estiver aberto
+                    if 'driver_aberto' in st.session_state and st.session_state['driver_aberto']:
+                        try:
+                            st.session_state['driver_aberto'].quit()
+                        except Exception:
+                            pass
+                        st.session_state['driver_aberto'] = None
+
+                    logs_gerados  = []
+                    log_placeholder = st.empty()
+
+                    def atualizar_log(msg):
+                        logs_gerados.append(msg)
+                        log_placeholder.markdown(
+                            "<br>".join(logs_gerados),
+                            unsafe_allow_html=True
+                        )
+
+                    dados_boleto = {
+                        **detalhes,
+                        "vencimento": data_vencimento.strftime("%d/%m/%Y"),
+                    }
+
+                    with st.spinner("Abrindo navegador e preenchendo dados..."):
+                        sucesso, mensagem = abrir_bradesco_e_preencher(
+                            login=st.session_state.get('bradesco_login', ''),
+                            senha=st.session_state.get('bradesco_senha', ''),
+                            dados=dados_boleto,
+                            log_fn=atualizar_log,
+                        )
+
+                    st.markdown("---")
+                    if sucesso:
+                        st.success(mensagem)
+                        st.info(
+                            "🖥️ O Chrome está aberto com os dados preenchidos. "
+                            "Revise as informações e clique em **Confirmar / Emitir** no site do Bradesco."
+                        )
+                    else:
+                        st.error(mensagem)
+                        st.markdown(
+                            "**Acesso manual:** "
+                            "[Bradesco Net Empresa ↗](https://www.ne2.bradesconetempresa.b.br/ibpjlogin/login.jsf)"
+                        )
+
+            st.markdown("---")
+
+            # ── DETALHES COMPLETOS ──────────────────────────────────
+            with st.expander("🗂️ Detalhes Completos do Processo", expanded=False):
+                campos_ocultos = {'boleto_anexado_texto', 'boleto_anexado_href'}
+                items = [(k, v) for k, v in detalhes.items() if k not in campos_ocultos]
+                col_e1, col_e2 = st.columns(2)
+                metade = len(items) // 2
+                with col_e1:
+                    for k, v in items[:metade]:
+                        st.write(f"**{k.replace('_', ' ').title()}:** {v}")
+                with col_e2:
+                    for k, v in items[metade:]:
+                        st.write(f"**{k.replace('_', ' ').title()}:** {v}")
+
+        else:
+            st.warning(f"Não foi possível carregar os detalhes para o Processo ID: {processo_id}.")
+
+    else:
+        st.warning("Selecione um processo válido na barra lateral.")
+
+elif 'login_status' in st.session_state and st.session_state.get('login_status') != "Login bem-sucedido!":
+    st.error("Por favor, faça o login na barra lateral para carregar os processos.")
+else:
+    st.info("👈 Faça o login na barra lateral e selecione um processo para começar.")
